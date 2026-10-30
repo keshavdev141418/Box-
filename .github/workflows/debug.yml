@@ -20,7 +20,7 @@ jobs:
           playwright install --with-deps chromium
 
       - name: Run debug
-        run: python debug.py
+        run: python debug2.py
 
       - name: Upload results
         if: always()
@@ -28,6 +28,6 @@ jobs:
         with:
           name: debug
           path: |
-            debug_*.png
-            debug_*.txt
+            debug2_*.png
+            debug2_*.txt
           if-no-files-found: ignore
