@@ -1,3 +1,4 @@
+
 import asyncio
 from pathlib import Path
 from playwright.async_api import async_playwright
@@ -23,53 +24,67 @@ async def main():
         page = await ctx.new_page()
         await page.goto(URL, wait_until="domcontentloaded", timeout=60000)
         await page.wait_for_timeout(8000)
-        await page.screenshot(path="debug_1_top.png")
 
-        # scroll to trigger lazy load
-        for _ in range(10):
-            await page.mouse.wheel(0, 1200)
-            await page.wait_for_timeout(800)
-
-        text = await page.locator("body").inner_text()
-        low = text.lower()
-        log("TITLE:", await page.title())
-        log("HAS CLLD:", "clld" in low)
-        log("HAS RECENT SENTIMENT TURNS:", "recent sentiment turns" in low)
-        log("HAS CLOUDFLARE/VERIFY:", any(k in low for k in ["verify you are human", "cloudflare", "just a moment", "captcha"]))
-        i = low.find("recent sentiment turns")
-        log("SNIPPET:", text[i:i + 300].replace("\n", " | ") if i >= 0 else "NOT FOUND")
-        log("BODY START:", text[:400].replace("\n", " | "))
-
-        await page.screenshot(path="debug_2_full.png", full_page=True)
-        Path("debug_page.txt").write_text(text[:30000])
-
-        # dropdowns
-        await page.evaluate("window.scrollTo(0, 0)")
-        await page.wait_for_timeout(1000)
-        combos = page.locator('[role="combobox"]')
-        n = await combos.count()
-        log("COMBOBOX COUNT:", n)
-
-        for i in range(n):
+        # close cookie banner
+        for sel in ['button:has-text("Decline")', 'button:has-text("Accept")']:
             try:
-                label = (await combos.nth(i).inner_text(timeout=3000))[:60].replace("\n", " ")
-                log(f"combobox {i} text:", label)
-                await combos.nth(i).click(timeout=5000)
-                await page.wait_for_timeout(1500)
-                opts = page.locator('[role="option"]')
-                oc = await opts.count()
-                log(f"  options after click: {oc}")
-                for k in range(min(oc, 40)):
-                    log("   opt", k, (await opts.nth(k).inner_text())[:50].replace("\n", " "))
-                inputs = await page.locator("input:visible").count()
-                log("  visible inputs:", inputs)
-                await page.screenshot(path=f"debug_3_combo{i}.png")
-                await page.keyboard.press("Escape")
-                await page.wait_for_timeout(500)
-            except Exception as e:
-                log(f"combobox {i} error:", e)
+                await page.locator(sel).first.click(timeout=2000)
+                break
+            except Exception:
+                pass
+        await page.wait_for_timeout(1000)
 
-        Path("debug_log.txt").write_text("\n".join(out))
+        # open the BTCUSDT dropdown by its text
+        trigger = page.get_by_text("BTCUSDT", exact=True).first
+        log("trigger count:", await page.get_by_text("BTCUSDT", exact=True).count())
+        await trigger.click(timeout=10000)
+        await page.wait_for_timeout(1500)
+        await page.screenshot(path="debug2_1_open.png")
+
+        inputs = page.locator("input:visible")
+        log("visible inputs:", await inputs.count())
+        for i in range(await inputs.count()):
+            log("  input", i,
+                await inputs.nth(i).get_attribute("placeholder"),
+                await inputs.nth(i).get_attribute("type"))
+
+        # type XAU in the search box
+        try:
+            await inputs.first.fill("XAU", timeout=3000)
+            await page.wait_for_timeout(2000)
+        except Exception as e:
+            log("fill error:", e)
+        await page.screenshot(path="debug2_2_search.png")
+
+        # dump dropdown text and html
+        body = await page.locator("body").inner_text()
+        i = body.find("XAU")
+        log("TEXT AROUND XAU:", body[max(0, i - 200): i + 800].replace("\n", " | ") if i >= 0 else "NO XAU TEXT")
+
+        for sel in ['[role="option"]', '[role="listbox"]', '[class*="option"]', '[class*="dropdown"]', '[class*="popover"]', '[class*="menu"]']:
+            try:
+                c = await page.locator(sel).count()
+                log(f"{sel}: {c}")
+                if c:
+                    html = await page.locator(sel).first.evaluate("e => e.outerHTML")
+                    log("   HTML:", html[:600].replace("\n", " "))
+            except Exception as e:
+                log(sel, "error", e)
+
+        # try to click the first item containing XAUUSDT
+        try:
+            item = page.get_by_text("XAUUSDT").first
+            await item.click(timeout=5000)
+            await page.wait_for_timeout(6000)
+            await page.screenshot(path="debug2_3_after.png", full_page=True)
+            body = await page.locator("body").inner_text()
+            j = body.lower().find("recent sentiment turns")
+            log("TITLE LINE:", [l for l in body.split("\n") if "Liquidation Levels" in l][:3])
+            log("AFTER CLICK TURNS:", body[j:j + 250].replace("\n", " | ") if j >= 0 else "NOT FOUND")
+        except Exception as e:
+            log("click XAUUSDT error:", e)
+
+        Path("debug2_log.txt").write_text("\n".join(out))
         await b.close()
 
 asyncio.run(main())
