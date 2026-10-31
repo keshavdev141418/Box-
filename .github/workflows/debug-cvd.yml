@@ -1,4 +1,5 @@
-name: debug
+
+name: debug-cvd
 
 on:
   workflow_dispatch:
@@ -6,7 +7,7 @@ on:
 jobs:
   debug:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@v4
 
@@ -20,14 +21,14 @@ jobs:
           playwright install --with-deps chromium
 
       - name: Run debug
-        run: python debug2.py
+        run: python debug_cvd.py
 
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: debug
+          name: debug-cvd
           path: |
-            debug2_*.png
-            debug2_*.txt
+            debug3_*.png
+            debug3_*.txt
           if-no-files-found: ignore
