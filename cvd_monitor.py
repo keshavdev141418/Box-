@@ -1,4 +1,3 @@
-
 import os
 import re
 import json
@@ -16,6 +15,12 @@ TIMEFRAMES = ["1m", "5m", "15m"]   # add "30m" here for a 4th tab
 MAX_ALERTS_PER_TF = 5              # avoid spam when 1m fires many signals
 KEEP_SEEN = 60
 BLOCKED = {"image", "media", "font"}
+BLOCK_URLS = ("termly.io", "cgmdsa.com", "plausible.coinglass.com",
+              "googletagmanager", "google-analytics", "doubleclick", "/_next/data/")
+DEFAULT_TF = "15m"
+IV = {"1m": "m1", "5m": "m5", "15m": "m15", "30m": "m30",
+      "1H": "h1", "4H": "h4", "1D": "d1"}
+POLL = 250  # ms
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -127,7 +132,8 @@ def compute_alerts(state, data):
 # ---------- Browser helpers ----------
 
 async def block_heavy(route):
-    if route.request.resource_type in BLOCKED:
+    req = route.request
+    if req.resource_type in BLOCKED or any(b in req.url for b in BLOCK_URLS):
         await route.abort()
     else:
         await route.continue_()
@@ -135,15 +141,6 @@ async def block_heavy(route):
 
 async def page_text(page):
     return flat(await page.locator("body").inner_text())
-
-
-async def dismiss_cookies(page):
-    for sel in ['button:has-text("Decline")', 'button:has-text("Accept")']:
-        try:
-            await page.locator(sel).first.click(timeout=1000)
-            return
-        except Exception:
-            pass
 
 
 async def click_visible(page, text):
@@ -156,7 +153,7 @@ async def click_visible(page, text):
             if not await el.is_visible():
                 continue
             try:
-                await el.click(timeout=3000)
+                await el.click(timeout=2000)
             except Exception:
                 await el.dispatch_event("click")
             return True
@@ -165,29 +162,54 @@ async def click_visible(page, text):
     return False
 
 
+async def click_when_ready(page, text, secs=15):
+    loop = asyncio.get_event_loop()
+    end = loop.time() + secs
+    while loop.time() < end:
+        if await click_visible(page, text):
+            return True
+        await page.wait_for_timeout(POLL)
+    return False
+
+
 async def wait_for_text(page, text, secs):
-    for _ in range(int(secs * 2)):
+    for _ in range(int(secs * 1000 / POLL)):
         if text in await page_text(page):
             return True
-        await page.wait_for_timeout(500)
+        await page.wait_for_timeout(POLL)
     return False
 
 
 async def wait_label(page, tf, secs=10):
-    for _ in range(int(secs * 2)):
+    for _ in range(int(secs * 1000 / POLL)):
         label, _, _ = parse_state(await page_text(page))
         if label and label.lower() == tf.lower():
             return True
-        await page.wait_for_timeout(500)
+        await page.wait_for_timeout(POLL)
     raise RuntimeError(f"chart label never changed to {tf}")
 
 
-async def stabilize(page, min_s=2.0, max_s=20.0, quiet=6):
-    """Wait until card + table text stops changing (data finished loading)."""
+async def klines_idle(page, seen_iv, inflight, tf, max_s=12):
+    """Wait until candles of this timeframe arrived and no kline request is pending."""
+    loop = asyncio.get_event_loop()
+    want = IV.get(tf)
+    start = loop.time()
+    while loop.time() - start < max_s:
+        arrived = want in seen_iv or (tf != DEFAULT_TF and bool(seen_iv - {IV[DEFAULT_TF]}))
+        if arrived and inflight["n"] == 0:
+            await page.wait_for_timeout(500)
+            if inflight["n"] == 0:
+                return True
+        await page.wait_for_timeout(POLL)
+    return False
+
+
+async def stabilize(page, min_s=0.5, max_s=10.0, quiet=3):
+    """Wait until card + table text stops changing."""
     loop = asyncio.get_event_loop()
     start, last, same = loop.time(), None, 0
     while loop.time() - start < max_s:
-        await page.wait_for_timeout(500)
+        await page.wait_for_timeout(POLL)
         _, card, rows = parse_state(await page_text(page))
         sig = json.dumps([card, rows[:3]])
         same = same + 1 if sig == last else 0
@@ -198,7 +220,9 @@ async def stabilize(page, min_s=2.0, max_s=20.0, quiet=6):
 
 async def scrape_tf(browser, sem, tf):
     async with sem:
+        loop = asyncio.get_event_loop()
         for attempt in (1, 2):
+            t0 = loop.time()
             ctx = await browser.new_context(
                 user_agent=UA,
                 viewport={"width": 1366, "height": 900},
@@ -208,54 +232,64 @@ async def scrape_tf(browser, sem, tf):
             await ctx.route("**/*", block_heavy)
             page = await ctx.new_page()
 
-            intervals = set()
+            seen_iv, inflight = set(), {"n": 0}
+
+            def on_req(r):
+                if "kline" in r.url:
+                    inflight["n"] += 1
+
+            def on_done(r):
+                if "kline" in r.url:
+                    inflight["n"] = max(0, inflight["n"] - 1)
 
             def on_resp(r):
                 if "kline" in r.url:
                     m = re.search(r"interval=(\w+)", r.url)
                     if m:
-                        intervals.add(m.group(1))
+                        seen_iv.add(m.group(1))
 
+            page.on("request", on_req)
+            page.on("requestfinished", on_done)
+            page.on("requestfailed", on_done)
             page.on("response", on_resp)
             try:
                 await page.goto(URL, wait_until="domcontentloaded", timeout=30000)
-                await dismiss_cookies(page)
-                try:
-                    await page.wait_for_function(
-                        "() => /Latest divergence[\\s\\S]{0,120}Confirmed/.test(document.body.innerText)",
-                        timeout=25000,
-                    )
-                except Exception:
-                    print(f"{tf}: 'Latest divergence' card not loaded yet")
-                await stabilize(page, min_s=2.0)
 
-                label, _, _ = parse_state(await page_text(page))
-                if not label or label.lower() != tf.lower():
-                    before = set(intervals)
-                    if not await click_visible(page, tf):
-                        raise RuntimeError(f"button {tf} not clickable")
-                    await wait_label(page, tf)
-                    for _ in range(20):                      # wait for new candles
-                        if intervals - before:
+                if tf.lower() != DEFAULT_TF.lower():
+                    switched = False
+                    for _ in range(3):          # first click can be lost before hydration
+                        if not await click_when_ready(page, tf, 15):
                             break
-                        await page.wait_for_timeout(500)
-                    await stabilize(page, min_s=2.5)
+                        try:
+                            await wait_label(page, tf, secs=3)
+                            switched = True
+                            break
+                        except RuntimeError:
+                            continue
+                    if not switched:
+                        raise RuntimeError(f"could not switch to {tf}")
+                else:
+                    await wait_label(page, tf, secs=20)
 
-                if await click_visible(page, "Divergences"):
-                    await wait_for_text(page, "Based on", 8)
-                    await stabilize(page, min_s=1.5)
+                if not await klines_idle(page, seen_iv, inflight, tf):
+                    print(f"{tf}: candle load not confirmed, continuing")
+
+                if await click_when_ready(page, "Divergences", 10):
+                    await wait_for_text(page, "Based on", 6)
                 else:
                     print(f"{tf}: Divergences tab not clickable, using top card only")
+                await stabilize(page)
 
                 label, card, rows = parse_state(await page_text(page))
                 if not label or label.lower() != tf.lower():
                     raise RuntimeError(f"page shows {label}, expected {tf}")
                 if not rows and card:
                     rows = [card]
-                print(f"{tf}: {len(rows)} rows, latest: {rows[0] if rows else 'none'}")
+                print(f"{tf}: {len(rows)} rows in {loop.time() - t0:.1f}s, "
+                      f"latest: {rows[0] if rows else 'none'}")
                 return rows
             except Exception as e:
-                print(f"{tf}: attempt {attempt} FAILED -> {e}")
+                print(f"{tf}: attempt {attempt} FAILED after {loop.time() - t0:.1f}s -> {e}")
                 try:
                     await page.screenshot(path=f"debug_cvd_{tf}_{attempt}.png")
                     t = await page_text(page)
