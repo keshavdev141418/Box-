@@ -1,0 +1,70 @@
+
+name: cvd-monitor
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cvd-monitor
+  cancel-in-progress: false
+
+jobs:
+  cvd:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Cache Playwright browser
+        id: pw
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: pw-${{ runner.os }}-chromium-v1
+
+      - name: Install dependencies
+        run: |
+          pip install playwright
+          if [ "${{ steps.pw.outputs.cache-hit }}" != "true" ]; then
+            playwright install chromium
+          fi
+
+      - name: Run CVD monitor
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python cvd_monitor.py
+
+      - name: Save state
+        if: success()
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add cvd_state.json
+          if ! git diff --staged --quiet; then
+            git commit -m "update cvd state"
+            for i in 1 2 3; do
+              git pull --rebase origin main && git push && break
+              sleep 3
+            done
+          fi
+
+      - name: Upload debug files
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-cvd
+          path: debug_cvd_*.png
+          if-no-files-found: ignore
